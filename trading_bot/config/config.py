@@ -1,3 +1,4 @@
+from decimal import Decimal
 from pathlib import Path
 
 from pydantic import Field
@@ -12,6 +13,8 @@ class Config(BaseSettings):
     model_config = SettingsConfigDict(env_file=ENV_PATH, env_file_encoding="utf-8")
     TOKEN: str = Field(alias="token")
     account_id: str = Field(alias="account_id")
+    portfolio_size: Decimal = Field(alias="portfolio_size")
+
 
 if __name__ == '__main__':
-    print(Config().TOKEN)
+    print(type(Config().portfolio_size))

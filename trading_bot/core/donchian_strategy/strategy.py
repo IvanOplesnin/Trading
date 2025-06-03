@@ -1,4 +1,4 @@
-import asyncio
+import dataclasses
 import math
 from dataclasses import dataclass
 from decimal import Decimal
@@ -7,12 +7,12 @@ from typing import Optional
 from tinkoff import invest as ti
 from tinkoff.invest.utils import quotation_to_decimal, decimal_to_quotation
 
+from trading_bot.config.config import Config
 from trading_bot.core.base_state import BaseState
 from trading_bot.core.base_strategy import BaseStrategy
 from trading_bot.core.orders.order_listener import OrderListener
-from trading_bot.core.orders.order_manager import OrderManager
+from trading_bot.core.orders.order_manager import OrderEvent, OrderEventType
 from trading_bot.core.utils import calc_point_price, create_order_id
-from trading_bot.tinkoff_client.client import TinkoffClient
 
 
 @dataclass(repr=True)
@@ -26,24 +26,62 @@ class DonchianData:
 
 class WaitingBreakoutState(BaseState, OrderListener):
 
+    def __init__(self, context: 'DonchianStrategy'):
+        OrderListener.__init__(self)
+        self.context: 'DonchianStrategy' = context
+
+        self._params: Optional[ti.PostOrderRequest] = None
+        self._order_id: Optional[str] = None
+
+        self._fill_quantity: int = 0
+        self._execute_lots: int = 0
+
     async def new_price(
             self, *,
             price: ti.LastPrice,
-            context: 'DonchianStrategy',
-            client: TinkoffClient
+            context: 'DonchianStrategy'
     ):
-        if self.order_manager is not None:
-            price = quotation_to_decimal(price.price)
-            await self.order_manager.new_price(price=price, func=self.replace_order)
-            return
-        if direction := self._check_breakout(price, self.context.data):
-            params_order = self._get_params_order(direction, self.context)
-            order: ti.Order = await client.post_order(params_order)
-            self.order_manager = OrderManager(order, self)
-            asyncio.create_task(self.order_manager.start())
+        if self._order_id is not None:
+            if new_pr := self._check_replace_order(price=price):
+                new_quantity = self._execute_lots - self._fill_quantity
+                if new_quantity != 0:
+                    new_id = await self.order_manager.replace_order(
+                        old_id=self._order_id,
+                        new_price=new_pr,
+                        new_quantity=new_quantity
+                    )
+                    self._order_id = new_id
+                    self._params = dataclasses.replace(
+                        self._params,
+                        price=decimal_to_quotation(new_pr),
+                        quantity=new_quantity
+                    )
 
-    async def order_handler(self, *, orders: list[ti.OrderState]):
-        pass
+        if direction := self._check_breakout(price=price, data=context.data):
+            params_order = self._get_params_order(direction=direction, context=context)
+            order_id = await self.order_manager.place_order(req=params_order, listener=self)
+            if order_id:
+                self._order_id = order_id
+                self._params = params_order
+                self._execute_lots = params_order.quantity
+
+    async def order_handler(self, *, order_event: OrderEvent):
+        if order_event.order_id == self._order_id:
+            ev_type = order_event.event_type
+            if ev_type == OrderEventType.FILLED:
+                self._to_position_state()
+            elif ev_type == OrderEventType.PARTIAL:
+                self._fill_quantity = order_event.filled_qty
+
+    # Не публичные методы __________________________________________________________________
+
+    def _to_position_state(self):
+        self.context.state = PositionState(context=self.context)
+        self.context.units = 1
+        self.context.quantity = self._fill_quantity
+        self.context.direction = self._params.direction
+        self.context.next_entry_price = self.context.state._calc_next_entry_price()
+        self.context.next_stop_loss = self.context.state._calc_next_stop_loss()
 
     @staticmethod
     def _check_breakout(
@@ -89,18 +127,26 @@ class WaitingBreakoutState(BaseState, OrderListener):
         elif direction == ti.OrderDirection.ORDER_DIRECTION_SELL:
             return context.data.breakout_short_20 - min_price_increment
 
-    def replace_order(self, price: Decimal, order: ti.PostOrderResponse):
-        pass
+    def _check_replace_order(self, price: ti.LastPrice) -> Optional[Decimal]:
+        pr = quotation_to_decimal(price.price)
+        old_pr = quotation_to_decimal(self._params.price)
+        direct = self._params.direction
+
+        if (direct == ti.OrderDirection.ORDER_DIRECTION_BUY and
+                pr >= old_pr + (self.context.data.average_true_range * Decimal(0.5))):
+            return old_pr + (self.context.data.average_true_range * Decimal(0.5))
+        elif (direct == ti.OrderDirection.ORDER_DIRECTION_SELL and
+              pr <= old_pr - (self.context.data.average_true_range * Decimal(0.5))):
+            return old_pr - (self.context.data.average_true_range * Decimal(0.5))
 
 
 class DonchianStrategy(BaseStrategy):
 
-    def __init__(self, instrument: ti.Future, size_portfolio: Decimal, client: TinkoffClient):
+    def __init__(self, instrument: ti.Future):
         self.data: DonchianData = None
-        self.size_portfolio: Decimal = size_portfolio  # TODO: показывает от какой цены мы торгуемся.
+        self.size_portfolio: Decimal = Config().size_portfolio
         self.instrument: ti.Future = instrument
         self.state: BaseState = WaitingBreakoutState(context=self)
-        self.account_id: str = client.account_id
 
         self.quantity: int = 0
         self.units: int = 0
@@ -108,10 +154,5 @@ class DonchianStrategy(BaseStrategy):
         self.next_entry_price: Optional[Decimal] = None
         self.next_stop_loss: Optional[Decimal] = None
 
-        self.client = client
-
     async def new_price(self, price: ti.LastPrice):
         await self.state.new_price(context=self, price=price)
-
-    async def order_handler(self, order: ti.Order):
-        await self.state.order_handler(context=self, order=order)

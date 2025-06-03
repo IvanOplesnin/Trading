@@ -59,10 +59,10 @@ class OrderManager:
     ) -> str:
         resp: ti.PostOrderResponse = await self._client.post_order(req)
         order_id = resp.order_id
+
         self._listeners[order_id] = listener
         new_task = asyncio.create_task(self._watch_order(order_id))
         self._poll_tasks[order_id] = new_task
-        new_task.add_done_callback(lambda _: self._poll_tasks.pop(order_id, None))
         self._meta_request[order_id] = req
         return order_id
 
@@ -73,6 +73,7 @@ class OrderManager:
             new_quantity: int
     ):
         new_id = None
+        watcher: asyncio.Task = None
         old_req = self._meta_request.get(old_id)
         if not old_req:
             raise ValueError("Unknown order id")
@@ -81,8 +82,8 @@ class OrderManager:
             s = await self._client.get_status_order(old_id)
             if (s.execution_report_status
                     == ti.OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL):
-                return
-            async with (lock):
+                return old_id
+            async with lock:
                 watcher: asyncio.Task = self._poll_tasks.pop(old_id, None)
                 cancel_res = await self._client.cancel_order(old_id)
 
@@ -101,7 +102,6 @@ class OrderManager:
             if watcher:
                 self._poll_tasks[old_id] = watcher
             raise
-
         finally:
             self._replace_lock.release(old_id)
 
